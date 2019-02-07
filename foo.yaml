@@ -1,0 +1,23 @@
+apiVersion: db.isotoma.com/v1alpha1
+kind: Database
+metadata:
+  name: foo
+spec:
+  provider: mysql
+  connect:
+    host: testdb
+    port: "3306"
+  credentials:
+    username:
+      value: mysql
+    password:
+      value: password
+  backupTo:
+    s3:
+      region: eu-west-1
+      bucket: db-operator-test
+      prefix: test
+  awsCredentials:
+    region: eu-west-1
+    accessKeyID: xxx
+    secretAccessKey: yyy
