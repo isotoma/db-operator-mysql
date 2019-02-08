@@ -1,22 +1,9 @@
-GO ?= go
-BINDIR := $(CURDIR)/bin
-GOFLAGS :=
+.PHONY: all build deps
 
-BUILD_NUMBER=`cat build-number`
+all: deps build
 
-.PHONY: release build dep strip docker test dep-links 
+build:
+	./build.sh
 
-release: build strip
-
-build: vendor #.vendor-links.stamp
-	CGO_ENABLED=0 GOBIN=$(BINDIR) $(GO) install $(GOFLAGS) github.com/isotoma/db-operator-mysql/cmd/...
-
-strip:
-	strip bin/*
-
-test:
-	cd pkg/heartbeat && go test
-
-vendor:
-	dep ensure	
-
+deps:
+	./update_deps.sh
