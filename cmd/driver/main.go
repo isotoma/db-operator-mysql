@@ -3,40 +3,36 @@ package main
 import (
 	"os"
 	"io"
-	"io/ioutil"
 	"fmt"
+	"strings"
+	"os/exec"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
-	"github.com/isotoma/db-operator/pkg/provider"
+	"github.com/isotoma/db-operator/pkg/driver"
 	"go.uber.org/zap"
 
 	"database/sql"
 	"github.com/go-sql-driver/mysql"
-	"github.com/JamesStewy/go-mysqldump"
 )
 
 var log logr.Logger
 
-// Questions:
-//
-// Do these functions need to handle errors?
-//  - What kind of errors?
-//    - Thing already exists, is that a no-op, or an error?
-//  - When should it panic, when should it return an error?
-// What things are passed along with the driver, namely in p.Connect, which is a map[string]string
-//  - How should it handle missing values here?
+func getDB(d *driver.Driver) (*sql.DB, error) {
+	log.Info(fmt.Sprintf("Using driver config: %+v", d))
 
-func getDB(d *provider.Driver, dbName string) (*sql.DB, error) {
 	conn := &mysql.Config{
 		User: d.Master.Username,
-		Passwd: "[password]",
+		Passwd: "[password]",  // leave out the password for logging
 		Net: "tcp", // as config?
-		Addr: fmt.Sprintf("%s:%d", d.Connect["host"], d.Connect["port"]),
-		DBName: dbName,
+		Addr: fmt.Sprintf("%s:%s", d.Connect["host"], d.Connect["port"]),
+		DBName: "",  // don't select a database
+		Params: map[string]string{
+			"allowNativePasswords": "true",
+		},
 	}
 
-	log.Info("Using connection string: %s", conn.FormatDSN())
+	log.Info(fmt.Sprintf("Using connection string: %s", conn.FormatDSN()))
 	conn.Passwd = d.Master.Password;
 	connString := conn.FormatDSN()
 
@@ -44,111 +40,107 @@ func getDB(d *provider.Driver, dbName string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Info("DB: %v", db)
 	return db, nil
 }
 
-func create(d *provider.Driver) error {
+func MysqlEscapeString(value string) string {
+	// Annoyingly, we do have to do this because we can't use
+	// parameters like 'CREATE DATABASE ?'. There's only so much
+	// value in defending against a user who can create and drop
+	// databases anyway, but we still want some certainty that the
+	// command will do what we expect.
+	replace := map[string]string{"\\":"\\\\", "'":`\'`, "\\0":"\\\\0", "\n":"\\n", "\r":"\\r", `"`:`\"`, "\x1a":"\\Z"}
+	for b, a := range replace {
+		value = strings.Replace(value, b, a, -1)
+	}
+	return value
+}
+
+func create(d *driver.Driver) error {
 	log.Info("Create called")
 
-	db, dbErr := getDB(d, "/")
-	if dbErr != nil {
-		return dbErr
+	db, err := getDB(d)
+	if err != nil {
+		log.Error(err, "Error getting DB client")
+		return err
 	}
 
-	log.Info("Creating DB %s...", d.Name)
-	// If not exists?
-	_, err := db.Exec("CREATE DATABASE " + d.Name)
+	log.Info(fmt.Sprintf("Creating DB %s...", d.DBName))
+	createCmd := "CREATE DATABASE IF NOT EXISTS " + MysqlEscapeString(d.DBName)
+	log.Info(fmt.Sprintf("Running: %s", createCmd))
+	_, err = db.Exec(createCmd)
 	if err != nil {
+		log.Error(err, "Error creating database")
+		return err
+	}
+
+	log.Info(fmt.Sprintf("Granting permissions on DB %s to %s", d.DBName, d.Database.Username))
+	log.Info(fmt.Sprintf("Granting permissions on DB %s to %s", d.DBName, d.Database.Username))
+	grantCmd := fmt.Sprintf("GRANT ALL PRIVILEGES on %s.* TO %s@'%%' IDENTIFIED BY '%s'", MysqlEscapeString(d.DBName), MysqlEscapeString(d.Database.Username), MysqlEscapeString(d.Database.Password))
+	log.Info(fmt.Sprintf("Running: %s", grantCmd))
+	_, err = db.Exec(grantCmd)
+	if err != nil {
+		log.Error(err, "Error granting permissions on database")
 		return err
 	}
 
 	return nil
 }
 
-func drop(d *provider.Driver) error {
+func drop(d *driver.Driver) error {
 	log.Info("Drop called")
 
-	log.Info("Getting DB connection dumper...")
-	db, err := getDB(d, "/")
+	db, err := getDB(d)
 	if err != nil {
-		log.Error(err, "Error getting DB connection")
+		log.Error(err, "Error getting DB client")
 		return err
 	}
 
-	log.Info("Dropping DB %s...", d.Name)
-	// If exists?
-	_, err = db.Exec("DROP DATABASE " + d.Name)
+	log.Info(fmt.Sprintf("Dropping DB %s...", d.DBName))
+	_, err = db.Exec("DROP DATABASE IF EXISTS " + MysqlEscapeString(d.DBName))
 	if err != nil {
-		log.Error(err, "Error dropping DB: %s", d.Name)
+		log.Error(err, fmt.Sprintf("Error dropping DB: %s", d.Name))
+		return err
+	}
+
+	log.Info(fmt.Sprintf("Dropping user %s...", d.Database.Username))
+	_, err = db.Exec(fmt.Sprintf("DROP USER IF EXISTS %s@'%%'", MysqlEscapeString(d.DBName)))
+	if err != nil {
+		log.Error(err, fmt.Sprintf("Error dropping user: %s", d.Database.Username))
 		return err
 	}
 
 	return nil
 }
 
-func backup(d *provider.Driver, w *io.Writer) error {
+func backup(d *driver.Driver) (*io.ReadCloser, error) {
 	log.Info("Backup called")
 
-	log.Info("Creating temporary directory for dumping...")
-	tempDir, err := ioutil.TempDir("", "mysql-backup")
+	args := []string{
+		"--host", d.Connect["host"],
+		"--port", d.Connect["port"],
+		"--user", d.Master.Username,
+		d.DBName,
+	}
+	backupCmd := exec.Command("mysqldump", args...)
+	backupCmd.Env = []string{
+		fmt.Sprintf("MYSQL_PWD=%s", d.Master.Password),
+	}
+	backupCmd.Stderr = os.Stderr
+
+	backupOutput, err := backupCmd.StdoutPipe()
+
 	if err != nil {
-		log.Error(err, "Error creating temporary directory for dumping")
-		return err
+		return nil, err
 	}
-
-	log.Info("Getting DB connection dumper...")
-	db, err := getDB(d, d.Name)
+	log.Info("Backup command starting")
+	err = backupCmd.Start()
 	if err != nil {
-		log.Error(err, "Error getting DB connection")
-		return err
+		return nil, err
 	}
 
-	// Check if exists?
-	log.Info("Registering dumper...")
-	dumper, err := mysqldump.Register(db, tempDir, d.Name)
-	if err != nil {
-		log.Error(err, "Error registering dumper")
-		return err
-	}
-
-	log.Info("Dumping...")
-	resultFilepath, err := dumper.Dump()
-	if err != nil {
-		log.Error(err, "Error running dumper")
-		return err
-	}
-
-	log.Info("Opening dump file")
-
-	const FileBufferSize = 4096
-	file, err := os.Open(resultFilepath)
-	if err != nil {
-		log.Error(err, "Error opening dump file")
-		return err
-	}
-	defer file.Close()
-
-	log.Info("Copying dump to writer")
-
-	buffer := make([]byte, FileBufferSize)
-
-	for {
-		bytesread, err := file.Read(buffer)
-		if err != nil {
-			if err != io.EOF {
-				log.Error(err, "Error reading chunk from dump file")
-				return err
-			}
-
-			break
-		}
-		(*w).Write(buffer[:bytesread])
-	}
-
-	log.Info("Dump written to writer")
-
-	return nil
+	log.Info("Returning backup output reader")
+	return &backupOutput, nil
 }
 
 func main() {
@@ -158,14 +150,14 @@ func main() {
 	}
 	log = zapr.NewLogger(zlog).WithName("db-operator-mysql")
 
-	d := &provider.Driver{
+	d := &driver.Driver{
 		Name:   "mysql",
 		Create: create,
 		Drop:   drop,
 		Backup: backup,
 	}
 
-	p := provider.Provider{}
+	p := driver.Container{}
 	p.RegisterDriver(d)
 	if err := p.Run(); err != nil {
 		panic(err)

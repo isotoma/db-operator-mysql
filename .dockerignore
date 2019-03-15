@@ -1,0 +1,4 @@
+*
+!cmd/
+!Gopkg.lock
+!Gopkg.toml

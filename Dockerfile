@@ -37,5 +37,6 @@ RUN go install db-operator-mysql/cmd/... && strip bin/* && cp bin/driver /build/
 ######
 
 FROM alpine
+RUN apk add --update mariadb-client ca-certificates  # to install mysqldump and ca certs
 COPY --from=builder /build/db-operator-mysql /
 CMD /db-operator-mysql
